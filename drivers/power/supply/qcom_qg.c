@@ -137,7 +137,13 @@ static int qcom_qg_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
+		/* shortcut: a full battery on the charger reads as discharging */
+		ret = qcom_qg_get_current(chip,
+				QG_LAST_ADC_I_DATA0_REG, &val->intval);
+		if (ret)
+			return ret;
+		val->intval = val->intval > 0 ? POWER_SUPPLY_STATUS_CHARGING :
+						POWER_SUPPLY_STATUS_DISCHARGING;
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
