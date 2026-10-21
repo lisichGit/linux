@@ -29,6 +29,9 @@
 #define QG_SDAM_OCV_OFFSET		0x4c /* 4-byte 0x4c-0x4f */
 #define QG_SDAM_LEARNED_CAPACITY_OFFSET	0x68 /* 2-byte 0x68-0x69 */
 
+/* Larger IR drops come from glitched current readings, not the battery */
+#define QG_MAX_IR_DROP_UV		300000
+
 struct qcom_qg_chip {
 	struct device *dev;
 	struct regmap *regmap;
@@ -85,14 +88,43 @@ static int qcom_qg_get_voltage(struct qcom_qg_chip *chip, u8 offset, int *val)
 }
 
 /*
- * Yes, this function simply calculates the capacity based on
- * the current voltage. This will be rewritten in the future.
+ * With an OCV table, estimate the open-circuit voltage by removing the IR drop
+ * of the battery and look it up. Otherwise interpolate the average voltage
+ * linearly between the design limits.
  */
 static int qcom_qg_get_capacity(struct qcom_qg_chip *chip, int *val)
 {
-	int ret, voltage_now;
+	struct power_supply_battery_info *info = chip->batt_info;
+	int ret, voltage_now, current_now, ir_drop = 0, temp;
 	int voltage_min = chip->batt_info->voltage_min_design_uv;
 	int voltage_max = chip->batt_info->voltage_max_design_uv;
+
+	if (info->ocv_table[0]) {
+		ret = qcom_qg_get_voltage(chip, QG_LAST_ADC_V_DATA0_REG,
+					  &voltage_now);
+		if (ret)
+			return ret;
+
+		ret = qcom_qg_get_current(chip, QG_LAST_ADC_I_DATA0_REG,
+					  &current_now);
+		if (ret)
+			return ret;
+
+		ret = iio_read_channel_processed(chip->batt_therm_chan, &temp);
+		if (ret < 0)
+			return ret;
+
+		if (info->factory_internal_resistance_uohm > 0)
+			ir_drop = div_s64((s64)current_now *
+					  info->factory_internal_resistance_uohm,
+					  1000000);
+		ir_drop = clamp(ir_drop, -QG_MAX_IR_DROP_UV, QG_MAX_IR_DROP_UV);
+
+		/* millidegC to degC as used by ocv-capacity-celsius */
+		*val = power_supply_batinfo_ocv2cap(info, voltage_now - ir_drop,
+						    temp / 1000);
+		return 0;
+	}
 
 	ret = qcom_qg_get_voltage(chip,
 				QG_S2_NORMAL_AVG_V_DATA0_REG, &voltage_now);
