@@ -6,7 +6,9 @@
 #include <linux/iio/consumer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -32,11 +34,19 @@
 /* Larger IR drops come from glitched current readings, not the battery */
 #define QG_MAX_IR_DROP_UV		300000
 
+/* Fastest change of the reported capacity, 1% per step */
+#define QG_MSOC_STEP_MS			20000
+
 struct qcom_qg_chip {
 	struct device *dev;
 	struct regmap *regmap;
 	unsigned int base;
 	int ibat_lsb_na;
+
+	/* Reported capacity, -1 until the first read */
+	struct mutex lock;
+	int msoc;
+	unsigned long msoc_jiffies;
 
 	struct iio_channel *batt_therm_chan;
 
@@ -88,6 +98,38 @@ static int qcom_qg_get_voltage(struct qcom_qg_chip *chip, u8 offset, int *val)
 }
 
 /*
+ * Voltage based estimates jump with the load, e.g. by ~15% when a charger is
+ * plugged in. Let the reported capacity follow them by at most 1% per
+ * QG_MSOC_STEP_MS, and only in the direction the battery current flows.
+ */
+static int qcom_qg_smooth_capacity(struct qcom_qg_chip *chip, int soc,
+				   bool charging)
+{
+	unsigned long now = jiffies;
+	unsigned int steps;
+
+	guard(mutex)(&chip->lock);
+
+	if (chip->msoc < 0) {
+		chip->msoc = soc;
+		chip->msoc_jiffies = now;
+		return soc;
+	}
+
+	steps = (now - chip->msoc_jiffies) / msecs_to_jiffies(QG_MSOC_STEP_MS);
+	if (!steps)
+		return chip->msoc;
+
+	if (charging && soc > chip->msoc)
+		chip->msoc += min_t(unsigned int, soc - chip->msoc, steps);
+	else if (!charging && soc < chip->msoc)
+		chip->msoc -= min_t(unsigned int, chip->msoc - soc, steps);
+	chip->msoc_jiffies = now;
+
+	return chip->msoc;
+}
+
+/*
  * With an OCV table, estimate the open-circuit voltage by removing the IR drop
  * of the battery and look it up. Otherwise interpolate the average voltage
  * linearly between the design limits.
@@ -95,18 +137,17 @@ static int qcom_qg_get_voltage(struct qcom_qg_chip *chip, u8 offset, int *val)
 static int qcom_qg_get_capacity(struct qcom_qg_chip *chip, int *val)
 {
 	struct power_supply_battery_info *info = chip->batt_info;
-	int ret, voltage_now, current_now, ir_drop = 0, temp;
+	int ret, voltage_now, current_now, ir_drop = 0, temp, soc;
 	int voltage_min = chip->batt_info->voltage_min_design_uv;
 	int voltage_max = chip->batt_info->voltage_max_design_uv;
+
+	ret = qcom_qg_get_current(chip, QG_LAST_ADC_I_DATA0_REG, &current_now);
+	if (ret)
+		return ret;
 
 	if (info->ocv_table[0]) {
 		ret = qcom_qg_get_voltage(chip, QG_LAST_ADC_V_DATA0_REG,
 					  &voltage_now);
-		if (ret)
-			return ret;
-
-		ret = qcom_qg_get_current(chip, QG_LAST_ADC_I_DATA0_REG,
-					  &current_now);
 		if (ret)
 			return ret;
 
@@ -121,25 +162,26 @@ static int qcom_qg_get_capacity(struct qcom_qg_chip *chip, int *val)
 		ir_drop = clamp(ir_drop, -QG_MAX_IR_DROP_UV, QG_MAX_IR_DROP_UV);
 
 		/* millidegC to degC as used by ocv-capacity-celsius */
-		*val = power_supply_batinfo_ocv2cap(info, voltage_now - ir_drop,
-						    temp / 1000);
-		return 0;
-	}
+		soc = power_supply_batinfo_ocv2cap(info, voltage_now - ir_drop,
+						   temp / 1000);
+	} else {
+		ret = qcom_qg_get_voltage(chip,
+					QG_S2_NORMAL_AVG_V_DATA0_REG, &voltage_now);
+		if (ret) {
+			dev_err(chip->dev, "Failed to get current voltage: %d\n", ret);
+			return ret;
+		}
 
-	ret = qcom_qg_get_voltage(chip,
-				QG_S2_NORMAL_AVG_V_DATA0_REG, &voltage_now);
-	if (ret) {
-		dev_err(chip->dev, "Failed to get current voltage: %d\n", ret);
-		return ret;
-	}
-
-	if (voltage_now <= voltage_min)
-		*val = 0;
-	else if (voltage_now >= voltage_max)
-		*val = 100;
-	else
-		*val = (((voltage_now - voltage_min) * 100) /
+		if (voltage_now <= voltage_min)
+			soc = 0;
+		else if (voltage_now >= voltage_max)
+			soc = 100;
+		else
+			soc = (((voltage_now - voltage_min) * 100) /
 						(voltage_max - voltage_min));
+	}
+
+	*val = qcom_qg_smooth_capacity(chip, soc, current_now > 0);
 
 	return 0;
 }
@@ -307,6 +349,11 @@ static int qcom_qg_probe(struct platform_device *pdev)
 	if (IS_ERR(chip->sdam))
 		return dev_err_probe(chip->dev, PTR_ERR(chip->sdam),
 				     "Couldn't get SDAM nvmem device\n");
+
+	chip->msoc = -1;
+	ret = devm_mutex_init(chip->dev, &chip->lock);
+	if (ret)
+		return ret;
 
 	psy_cfg.drv_data = chip;
 	psy_cfg.fwnode = dev_fwnode(chip->dev);
