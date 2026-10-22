@@ -98,6 +98,35 @@ static int qcom_qg_get_voltage(struct qcom_qg_chip *chip, u8 offset, int *val)
 }
 
 /*
+ * Follow the charger while it is online, it knows when charging has
+ * terminated. Otherwise guess from the direction of the battery current.
+ */
+static int qcom_qg_get_status(struct qcom_qg_chip *chip,
+			      struct power_supply *psy, int *val)
+{
+	union power_supply_propval charger;
+	int ret, current_now;
+
+	ret = power_supply_get_property_from_supplier(psy, POWER_SUPPLY_PROP_STATUS,
+						      &charger);
+	if (!ret && (charger.intval == POWER_SUPPLY_STATUS_CHARGING ||
+		     charger.intval == POWER_SUPPLY_STATUS_FULL ||
+		     charger.intval == POWER_SUPPLY_STATUS_NOT_CHARGING)) {
+		*val = charger.intval;
+		return 0;
+	}
+
+	ret = qcom_qg_get_current(chip, QG_LAST_ADC_I_DATA0_REG, &current_now);
+	if (ret)
+		return ret;
+
+	*val = current_now > 0 ? POWER_SUPPLY_STATUS_CHARGING :
+				 POWER_SUPPLY_STATUS_DISCHARGING;
+
+	return 0;
+}
+
+/*
  * Voltage based estimates jump with the load, e.g. by ~15% when a charger is
  * plugged in. Let the reported capacity follow them by at most 1% per
  * QG_MSOC_STEP_MS, and only in the direction the battery current flows.
@@ -134,10 +163,11 @@ static int qcom_qg_smooth_capacity(struct qcom_qg_chip *chip, int soc,
  * of the battery and look it up. Otherwise interpolate the average voltage
  * linearly between the design limits.
  */
-static int qcom_qg_get_capacity(struct qcom_qg_chip *chip, int *val)
+static int qcom_qg_get_capacity(struct qcom_qg_chip *chip,
+				struct power_supply *psy, int *val)
 {
 	struct power_supply_battery_info *info = chip->batt_info;
-	int ret, voltage_now, current_now, ir_drop = 0, temp, soc;
+	int ret, voltage_now, current_now, ir_drop = 0, temp, soc, status;
 	int voltage_min = chip->batt_info->voltage_min_design_uv;
 	int voltage_max = chip->batt_info->voltage_max_design_uv;
 
@@ -181,7 +211,16 @@ static int qcom_qg_get_capacity(struct qcom_qg_chip *chip, int *val)
 						(voltage_max - voltage_min));
 	}
 
-	*val = qcom_qg_smooth_capacity(chip, soc, current_now > 0);
+	ret = qcom_qg_get_status(chip, psy, &status);
+	if (ret)
+		return ret;
+
+	/* A terminated charge means full, whatever the estimate says */
+	if (status == POWER_SUPPLY_STATUS_FULL)
+		soc = 100;
+
+	*val = qcom_qg_smooth_capacity(chip, soc, current_now > 0 ||
+					status == POWER_SUPPLY_STATUS_FULL);
 
 	return 0;
 }
@@ -211,13 +250,9 @@ static int qcom_qg_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		/* shortcut: a full battery on the charger reads as discharging */
-		ret = qcom_qg_get_current(chip,
-				QG_LAST_ADC_I_DATA0_REG, &val->intval);
+		ret = qcom_qg_get_status(chip, psy, &val->intval);
 		if (ret)
 			return ret;
-		val->intval = val->intval > 0 ? POWER_SUPPLY_STATUS_CHARGING :
-						POWER_SUPPLY_STATUS_DISCHARGING;
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
@@ -268,7 +303,7 @@ static int qcom_qg_get_property(struct power_supply *psy,
 		val->intval *= 1000; /* mAh to uAh */
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		ret = qcom_qg_get_capacity(chip, &val->intval);
+		ret = qcom_qg_get_capacity(chip, psy, &val->intval);
 		if (ret)
 			return ret;
 		break;
@@ -292,6 +327,7 @@ static struct power_supply_desc batt_psy_desc = {
 	.properties = qcom_qg_props,
 	.num_properties = ARRAY_SIZE(qcom_qg_props),
 	.get_property = qcom_qg_get_property,
+	.external_power_changed = power_supply_changed,
 };
 
 static int qcom_qg_probe(struct platform_device *pdev)
