@@ -559,7 +559,32 @@ static int smbx_ov_status(struct smb_chip *chip)
 	if (rc)
 		return rc;
 
-	return !!(val & mask);
+	if (!(val & mask))
+		return 0;
+
+	if (chip->gen != SMB5)
+		return 1;
+
+	/*
+	 * SMB5 also raises BAT_OV once a full battery settles slightly above
+	 * the float voltage, while the charger stays in taper or terminates
+	 * normally. Downstream qpnp-smb5 therefore only reports over-voltage
+	 * when the fuel gauge voltage is at least 40 mV above the float
+	 * voltage. Without a battery voltage here, only treat BAT_OV as a
+	 * fault once the charger itself has stopped charging.
+	 */
+	rc = regmap_read(chip->regmap,
+			 chip->base + BATTERY_CHARGER_STATUS_1, &val);
+	if (rc)
+		return rc;
+
+	switch (val & BATTERY_CHARGER_STATUS_MASK) {
+	case SMB5_PAUSE_CHARGE:
+	case SMB5_DISABLE_CHARGE:
+		return 1;
+	default:
+		return 0;
+	}
 }
 
 static int smb_map_charge_status(struct smb_chip *chip, u32 stat, int *val)
