@@ -334,6 +334,10 @@
 			  "PL_EN"; /* GPIO_10 */
 };
 
+&pm6150_qgauge {
+	power-supplies = <&pm6150_charger>;
+};
+
 &pm6150_typec {
 	connector {
 		/*
