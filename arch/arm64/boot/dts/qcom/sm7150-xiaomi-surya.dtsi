@@ -243,6 +243,25 @@
 			  "PL_EN"; /* GPIO_10 */
 };
 
+&pm6150_typec {
+	connector {
+		/*
+		 * The port is the only way to charge the phone, so it has to
+		 * be able to sink. Prefer the sink role when attached to
+		 * another dual-role port. Only 5 V is requested: higher input
+		 * voltages are only useful with the BQ2597x charge pump, which
+		 * is not supported.
+		 */
+		power-role = "dual";
+		try-power-role = "sink";
+
+		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE |
+			     PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)>;
+		/* 5 V at the 1.5 A input current limit of the charger */
+		op-sink-microwatt = <7500000>;
+	};
+};
+
 &pm6150l_flash {
 	status = "okay";
 };
