@@ -652,7 +652,7 @@ static inline int smb_get_current_limit(struct smb_chip *chip,
 	return rc;
 }
 
-static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
+static int smb_write_current_limit(struct smb_chip *chip, unsigned int val)
 {
 	unsigned char val_raw;
 
@@ -668,6 +668,56 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			    val_raw);
 }
 
+/*
+ * Unless ICL_OVERRIDE_AFTER_APSD is set, SMB5 replaces the programmed input
+ * current limit with its own choice once APSD completes. Downstream
+ * smblib_icl_override() keeps a software limit in "SW_OVERRIDE_HC_MODE":
+ * high-current mode, no USB51 override, limit held after APSD. Hardware AICL
+ * remains enabled and can still lower the effective limit.
+ */
+static int smb5_hold_icl_after_apsd(struct smb_chip *chip, bool hold)
+{
+	int rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_ICL_OPTIONS,
+				USBIN_MODE_CHG_BIT, USBIN_MODE_CHG_BIT);
+	if (rc < 0)
+		return rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + CMD_ICL_OVERRIDE,
+				ICL_OVERRIDE_BIT, 0);
+	if (rc < 0)
+		return rc;
+
+	return regmap_update_bits(chip->regmap, chip->base + USBIN_LOAD_CFG,
+				  ICL_OVERRIDE_AFTER_APSD_BIT,
+				  hold ? ICL_OVERRIDE_AFTER_APSD_BIT : 0);
+}
+
+static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
+{
+	int rc;
+
+	rc = smb_write_current_limit(chip, val);
+	if (rc < 0 || chip->gen != SMB5)
+		return rc;
+
+	return smb5_hold_icl_after_apsd(chip, true);
+}
+
+/* Return to the USB 2.0 default and hardware control when VBUS goes away */
+static void smb5_release_icl(struct smb_chip *chip)
+{
+	int rc;
+
+	rc = smb_write_current_limit(chip, SDP_CURRENT_UA);
+	if (!rc)
+		rc = smb5_hold_icl_after_apsd(chip, false);
+	if (rc < 0)
+		dev_err(chip->dev, "Couldn't release input current limit: %d\n",
+			rc);
+}
+
 static void smb_status_change_work(struct work_struct *work)
 {
 	unsigned int charger_type, current_ua;
@@ -678,8 +728,11 @@ static void smb_status_change_work(struct work_struct *work)
 	chip = container_of(work, struct smb_chip, status_change_work.work);
 
 	smb_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	if (!usb_online) {
+		if (chip->gen == SMB5)
+			smb5_release_icl(chip);
 		return;
+	}
 
 	for (count = 0; count < 3; count++) {
 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
