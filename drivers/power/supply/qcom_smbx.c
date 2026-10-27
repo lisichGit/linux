@@ -1310,6 +1310,26 @@ static const struct smb_match_data pm8150b_match_data = {
 	.usbin_current_scale = 5,
 };
 
+/*
+ * PM6150 uses the PM8150B SMB5 parameter table downstream, but its main
+ * charger is limited to a 3 A fast charge current (PM6150_MAX_FCC_UA).
+ */
+static const struct smb_match_data pm6150_match_data = {
+	.init_seq = smb5_init_seq,
+	.init_seq_len = ARRAY_SIZE(smb5_init_seq),
+	.name = "pm6150",
+	.gen = SMB5,
+	.fv_min_uv = 3600000,
+	.fv_max_uv = 4790000,
+	.fv_step_uv = 10000,
+	.fcc_max_ua = 3000000,
+	.fcc_step_ua = 50000,
+	.icl_max_ua = 5000000,
+	.icl_step_ua = 50000,
+	.icl_status = SMB5_AICL_ICL_STATUS,
+	.usbin_current_scale = 5,
+};
+
 static int smb_init_hw(struct smb_chip *chip,
 		       const struct smb_init_register *init_seq, size_t len)
 {
@@ -1531,6 +1551,7 @@ static int smb_probe(struct platform_device *pdev)
 static const struct of_device_id smb_match_id_table[] = {
 	{ .compatible = "qcom,pmi8998-charger", .data = &pmi8998_match_data },
 	{ .compatible = "qcom,pm660-charger", .data = &pm660_match_data },
+	{ .compatible = "qcom,pm6150-charger", .data = &pm6150_match_data },
 	{ .compatible = "qcom,pm8150b-charger", .data = &pm8150b_match_data },
 	{ /* sentinal */ }
 };
